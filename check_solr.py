@@ -14,6 +14,7 @@ OPTIONS:
 -W : webapp path
 -P : ping the solr cores on given webapp (not to be used with replication check)
 -r : check replication on the given webapp (not to be used with ping check)
+-f : check file descriptor count on the given webapp (not to be used with ping check)
 -w : delta between master and local replication version, to warn on (default 1)
 -c : delta between master and local replication version, to crit on (defualt 2)
 -i : ignore a core, use multiple times to ignore multiple cores.
@@ -47,24 +48,45 @@ def repstatus(core):
     localgeneration  = rdata['details'].get('generation')
     mastergeneration = rdata['details']['slave']['masterDetails']['master'].get('replicatableGeneration')
 
-    if mastergeneration == None or localgeneration == None:
+    if mastergeneration is None or localgeneration is None:
         status = "CRITICAL"
         return status
 
     generationdiff   = mastergeneration - localgeneration
 
-    if generationdiff > threshold_warn:
-        status = "WARNING"
-    elif generationdiff > threshold_crit:
+    if generationdiff > threshold_crit:
         status = "CRITICAL"
+    elif generationdiff > threshold_warn:
+        status = "WARNING"
     else:
         status = "UNKNOWN"
 
-    return status
+    return status, generationdiff
+
+def fdstatus(core):
+    system_cmd = baseurl + core + '/admin/system?' + urllib.urlencode({'wt':'json'})
+
+    rres = urllib.urlopen(system_cmd)
+    rdata = json.loads(rres.read())
+
+    openfd  = rdata['system'].get('openFileDescriptorCount')
+
+    if openfd is None:
+        status = "CRITICAL"
+        return status
+
+    if openfd > threshold_crit:
+        status = "CRITICAL"
+    elif openfd > threshold_warn:
+        status = "WARNING"
+    else:
+        status = "UNKNOWN"
+
+    return status, openfd
 
 def solrping(core):
     ping_cmd = baseurl + core + '/admin/ping?' + urllib.urlencode({'wt':'json'})
-    
+
     res = urllib.urlopen(ping_cmd)
     data = json.loads(res.read())
 
@@ -81,6 +103,7 @@ def main():
     cmd_parser.add_option("-W", "--webapp", type="string", action="store", dest="solr_server_webapp", help="SOLR Server webapp path")
     cmd_parser.add_option("-P", "--ping", action="store_true", dest="check_ping", help="SOLR Ping", default=False)
     cmd_parser.add_option("-r", "--replication", action="store_true", dest="check_replication", help="SOLR Replication check", default=False)
+    cmd_parser.add_option("-f", "--filedescriptor", action="store_true", dest="check_filedescriptor", help="SOLR File Descriptor check", default=False)
     cmd_parser.add_option("-w", "--warn", type="string", action="store", dest="threshold_warn", help="WARN threshold for replication check", default=1)
     cmd_parser.add_option("-c", "--critical", type="string", action="store", dest="threshold_crit", help="CRIT threshold for replication check", default=2)
     cmd_parser.add_option("-i", "--ignore", type="string", action="append", dest="ignore_cores", help="SOLR Cores to ignore", default="")
@@ -91,15 +114,15 @@ def main():
         cmd_parser.print_help()
         return(3)
 
-    if not cmd_options.check_replication and not cmd_options.check_ping:
-        print "ERROR: Please specify -r or -P"
+    if not cmd_options.check_replication and not cmd_options.check_filedescriptor and not cmd_options.check_ping:
+        print "ERROR: Please specify -r or -f or -P"
         return(3)
 
     if ((cmd_options.threshold_warn and not cmd_options.threshold_crit) or (cmd_options.threshold_crit and not cmd_options.threshold_warn)):
         print "ERROR: Please use -w and -c together."
         return(3)
 
-    if cmd_options.threshold_crit <= cmd_options.threshold_warn:
+    if int(cmd_options.threshold_crit) <= int(cmd_options.threshold_warn):
         print "ERROR: the value for (-c|--critical) must be greater than (-w|--warn)"
         return(3)
 
@@ -108,15 +131,18 @@ def main():
     solr_server_webapp  = cmd_options.solr_server_webapp
     check_ping          = cmd_options.check_ping
     check_replication   = cmd_options.check_replication
-    threshold_warn      = cmd_options.threshold_warn
-    threshold_crit      = cmd_options.threshold_crit
+    check_fd            = cmd_options.check_filedescriptor
+    threshold_warn      = int(cmd_options.threshold_warn)
+    threshold_crit      = int(cmd_options.threshold_crit)
     ignore_cores        = cmd_options.ignore_cores
 
     core_admin_url      = 'admin/cores?'
     baseurl             = 'http://' + solr_server + ':' + solr_server_port + '/' +  solr_server_webapp + '/'
 
-    repwarn             = []
-    repcrit             = []
+    repwarn             = {}
+    repcrit             = {}
+    fdwarn              = {}
+    fdcrit              = {}
 
     pingerrors          = []
 
@@ -129,7 +155,7 @@ def main():
         print "CRITICAL: probably couldn't format JSON data, check SOLR is ok"
         return(3)
     except:
-        print "CRITICAL: Unknown error" 
+        print "CRITICAL: Unknown error"
         return(3)
 
     # XXX: This is ugly...
@@ -138,11 +164,17 @@ def main():
             if core in ignore_cores:
                 continue 
             if check_replication:
-                ret = repstatus(core)
+                ret, versiondiff = repstatus(core)
                 if ret == 'CRITICAL':
-                    repcrit.append(core)
+                    repcrit[core] = versiondiff
                 elif ret == 'WARNING':
-                    repwarn.append(core)
+                    repwarn[core] = versiondiff
+            if check_fd:
+                ret, openfd = fdstatus(core)
+                if ret == 'CRITICAL':
+                    fdcrit[core] = openfd
+                elif ret == 'WARNING':
+                    fdwarn[core] = openfd
             if check_ping:
                 if solrping(core) != 'OK':
                     pingerrors.append(core)
@@ -157,18 +189,26 @@ def main():
             print "CRITICAL: unknown error (error string: {0})".format(strerror)
             print strerror
             return(3)
-    
+
     if pingerrors:
         print "CRITICAL: error pinging core(s) - ",
         print ", ".join(pingerrors)
         return(2)
     elif repcrit:
         print "CRITICAL: replication errors on core(s) -",
-        print ", ".join(repcrit)
+        print ", ".join(map(lambda pair: ": ".join(map(lambda val: str(val), pair)), repcrit.items()))
         return(2)
     elif repwarn:
         print "WARNING: replication errors on core(s) -",
-        print ", ".join(repwarn)
+        print ", ".join(map(lambda pair: ": ".join(map(lambda val: str(val), pair)), repwarn.items()))
+        return(1)
+    elif fdcrit:
+        print "CRITICAL: file descriptor errors on core(s) -",
+        print ", ".join(map(lambda pair: ": ".join(map(lambda val: str(val), pair)), fdcrit.items()))
+        return(2)
+    elif fdwarn:
+        print "WARNING: file descriptor errors on core(s) -",
+        print ", ".join(map(lambda pair: ": ".join(map(lambda val: str(val), pair)), fdwarn.items()))
         return(1)
     else:
         print "OK: no issues"
@@ -176,4 +216,4 @@ def main():
 
 if __name__ == '__main__':
     sys.exit(main())
-    
+
